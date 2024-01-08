@@ -372,10 +372,10 @@ def handle_file_listen(config):
                 # handle move after error
                 if request_has_failed or response.status_code != MI_POST_RESPONSE_RC:
                     logging.error(f"unable to send file to {config.MISendURI}")
-                    if response:
-                        logging.error(f"response code: {response.status_code}, body: {response.text}")
-                    if error:
-                        logging.error(f"Sending request failed: {error}")
+                    if request_has_failed:
+                        logging.error(f"request has failed! Error: {error}")
+                    if response.status_code != MI_POST_RESPONSE_RC:
+                        logging.error(f"response code: {response.status_code}")
 
                     # handle failure
                     # action none
