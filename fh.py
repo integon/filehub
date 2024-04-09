@@ -11,6 +11,8 @@ from fs import open_fs, errors
 import fnmatch
 import requests
 import re
+from fs.sshfs import SSHFS
+from urllib.parse import urlparse
 
 # "const" vars
 FILEHUB_CONF_FILENAME = "filehub.conf"
@@ -179,20 +181,20 @@ def send():
     
     send_config = config_entry[0]
 
-    if send_config.URIType == URIType.FILE:
-        msg, rc =handle_file_send(request, send_config)
-        if msg == None:
-            response = {"message": "transfer succeeded"}
-            return jsonify(response), MI_POST_RESPONSE_RC
-        response = {"error" : f"{msg}"}
-        return jsonify(response), rc
+    msg, rc =handle_file_send(request, send_config)
+    if msg == None:
+        response = {"message": "transfer succeeded"}
+        return jsonify(response), MI_POST_RESPONSE_RC
+    response = {"error" : f"{msg}"}
+    return jsonify(response), rc
 
-    if send_config.URIType == URIType.SFTP:
-        response = { "error": "SFTP is not implemented yet" }
-        return jsonify(response), 500
+
 
 
 def handle_file_send(request, config) -> (str, int):
+
+    if config.URIType != URIType.FILE and config.URIType != URIType.SFTP:
+        return "filesystem not supported", 500
 
     # get file from multipart
     if len(request.files) == 1:
@@ -220,44 +222,78 @@ def handle_file_send(request, config) -> (str, int):
         uploaded_file_name = request.headers.get(FILE_NAME_HEADER)
         uploaded_file_data = request.data
     
-    #get uri for local provider
-    uri_without_provider = get_uri_without_provider(config.FileURI)
+
+    # define fs based on submitted URI
+    fs = None
+    additional_path = None
+    if config.URIType == URIType.FILE:
+        additional_path = ""
+        uri_without_provider = get_uri_without_provider(config.FileURI)
+        fs = open_fs(f"osfs://{uri_without_provider}")
+    else:
+        if config.Auth != None and config.Auth == "cert":
+            # parse the uri to use SSHFS constructor
+            parsed_uri = urlparse(config.FileURI)
+            hostname = parsed_uri.hostname
+            username = parsed_uri.username
+            # password is used for either basic auth pw or to decrypt private key
+            password = None
+            if parsed_uri.password:
+                password = parsed_uri.password
+            if config.SFTPIdentityPassPhrase:
+                password = config.SFTPIdentityPassPhrase
+            # need to the additional path for different sftp handling witch basic or with cert
+            if parsed_uri.path:
+                additional_path = parsed_uri.path
+            else:
+                additional_path = ""
+            fs = SSHFS(host=hostname, user=username, passwd=password, pkey=config.SFTPIdentities)
+        else:
+            # parse the uri for additional path which is no automatically submitted when using open_fs
+            parsed_uri = urlparse(config.FileURI)
+            hostname = parsed_uri.hostname
+            username = parsed_uri.username
+            password = parsed_uri.password
+            if parsed_uri.path:
+                additional_path = parsed_uri.path
+            else:
+                additional_path = ""
+            fs = SSHFS(host=hostname, user=username, passwd=password)
 
     # write file to destination
     try:
-        # open fs
-        local_fs = open_fs(f"osfs://{uri_without_provider}")
 
         # determine target file name based on lock
         if config.Locking:
-            file_path = f"/{uploaded_file_name}{LOCKING_FILE_EXTENSION}"
-            file_path_no_lock = f"/{uploaded_file_name}"
+            file_path = f"{additional_path}/{uploaded_file_name}{LOCKING_FILE_EXTENSION}"
+            file_path_no_lock = f"{additional_path}/{uploaded_file_name}"
 
             # check if there is already a file locked with this name
-            if local_fs.exists(file_path):
-                local_fs.close()
+            if fs.exists(file_path):
+                fs.close()
                 raise Exception(f"lock file already exists: {file_path}")
         else:
-            file_path = f"/{uploaded_file_name}"
+            file_path = f"{additional_path}/{uploaded_file_name}"
         
         # write file (we dont care about encoding, since we write the same bytes as received)
-        with local_fs.open(file_path, "wb") as file:
+
+        with fs.open(file_path, "wb") as file:
             file.write(uploaded_file_data)
             file.flush()
 
         # if locking, release lock on file
         if config.Locking:
             # rename file
-            local_fs.move(file_path, file_path_no_lock, True)
+            fs.move(file_path, file_path_no_lock, True)
             # after renaming, overwrite variable for check
             file_path = file_path_no_lock
 
         # check existence of file
-        if not local_fs.exists(file_path):
+        if not fs.exists(file_path):
             logging.error(f"unable to write file {file_path}")
 
         # close fs
-        local_fs.close()
+        fs.close()
 
         # log file transfer
         logging.info(f"Successfully transfered file {uploaded_file_name} of config {config.Name}")
@@ -305,15 +341,15 @@ def listener(config):
 
     logging.info(f"Starting listener for {config.Name}")
 
-    # check what listener must be started
-    if config.URIType == URIType.FILE:
-        handle_file_listen(config)
-    if config.URIType == URIType.SFTP:
-        print("SFTP MUST BE IMPLEMENTED!")
+    # start listeining
+    handle_file_listen(config)
     
 def handle_file_listen(config):
 
     uri_without_provider = get_uri_without_provider(config.FileURI)
+
+    # define fs for listening
+    fs = None
 
     # run polling
     while True:
@@ -321,33 +357,68 @@ def handle_file_listen(config):
         # current timestamp
         before_polling_timestamp = current_milli_time()
 
+        if fs == None:
+            additional_path = None
+            if config.URIType == URIType.FILE:
+                uri_without_provider = get_uri_without_provider(config.FileURI)
+                fs = open_fs(f"osfs://{uri_without_provider}")
+            else:
+                if config.Auth != None and config.Auth == "cert":
+                    # parse the uri to use SSHFS constructor
+                    parsed_uri = urlparse(config.FileURI)
+                    hostname = parsed_uri.hostname
+                    username = parsed_uri.username
+                    # password is used for either basic auth pw or to decrypt private key
+                    password = None
+                    if parsed_uri.password:
+                        password = parsed_uri.password
+                    if config.SFTPIdentityPassPhrase:
+                        password = config.SFTPIdentityPassPhrase
+                    # need to the additional path for different sftp handling witch basic or with cert
+                    if parsed_uri.path:
+                        additional_path = parsed_uri.path
+                    else:
+                        additional_path = ""
+                    fs = SSHFS(host=hostname, user=username, passwd=password, pkey=config.SFTPIdentities)
+                else:
+                    additional_path = ""
+                    fs = open_fs(config.FileURI)
+
+        # read files from location
         try:
 
-            # open fs
-            local_fs = open_fs(f"osfs://{uri_without_provider}")
-
             # define lookup params
-            folder = "/"
+            folder = None
+            if additional_path:
+                folder = additional_path
+            else: 
+                folder = "/"
+
             pattern = config.FileNamePattern
 
             # get files from folder
-            folder_entries = local_fs.scandir(folder)
+            folder_entries = fs.scandir(folder)
             matching_files = [entry.name for entry in folder_entries if fnmatch.fnmatch(entry.name, pattern)]
+
+            print(f"found files: {len(matching_files)}")
             
             #loop through the files
             for file_name in matching_files:
                 # preserve original file name
                 original_file_name = file_name
+                # add additional path for file name if required
+                if additional_path:
+                    file_name = additional_path + "/" + file_name
                 # check if file is locked
                 if config.Locking:
-                    if local_fs.exists(f"{file_name}{LOCKING_FILE_EXTENSION}"):
+                    if fs.exists(f"{file_name}{LOCKING_FILE_EXTENSION}"):
                         continue
                     #lock file
-                    local_fs.move(f"{file_name}", f"{file_name}{LOCKING_FILE_EXTENSION}")
+                    fs.move(f"{file_name}", f"{file_name}{LOCKING_FILE_EXTENSION}")
                     file_name = f"{file_name}{LOCKING_FILE_EXTENSION}"
 
                 # read file - always as byte array, encoding is not interpreted
-                with local_fs.open(f"{file_name}", "rb") as file:
+                with fs.open(f"{file_name}", "rb") as file:
                     file_content = file.read()
 
                 # send file to mi
@@ -382,26 +453,26 @@ def handle_file_listen(config):
                     if config.ActionAfterFailure == ActionAfter.NONE:
                         # if locking is applied, remove lock
                         if config.Locking:
-                            local_fs.move(file_name, original_file_name)
+                            fs.move(file_name, original_file_name)
                         continue
                     
                     # action delete
                     if config.ActionAfterFailure == ActionAfter.DELETE:
                         logging.error(f"ActionAfterFailure is set to delete: deleting file: {original_file_name}")
-                        local_fs.remove(file_name)
+                        fs.remove(file_name)
                         continue
 
                     # action move
                     if config.ActionAfterFailure == ActionAfter.MOVE:
                         fail_folder = f"{config.MoveAfterFailure}"
                         try:
-                            local_fs.getinfo(fail_folder, namespaces=['basic'])
+                            fs.getinfo(fail_folder, namespaces=['basic'])
                         except errors.ResourceNotFound:
-                            local_fs.makedirs(fail_folder)
+                            fs.makedirs(fail_folder)
                         # move to error folder (and remove locking extension if needed)
                         target_file_name = f"{fail_folder}/{datetime.now().strftime('%Y%m%d_%H%M%S%f')[:-2]}_{original_file_name}"
-                        logging.error(f"ActionAfterFailure is set to move: moving file {original_file_name} to {target_file_name}")
-                        local_fs.move(file_name, target_file_name, True)
+                        logging.error(f"ActionAfterFailure is set to move: moving file {additional_path}/{original_file_name} to {target_file_name}")
+                        fs.move(file_name, target_file_name, True)
 
                         # handle next file - move after process is irrelevant because this file has failed
                         continue
@@ -414,48 +485,47 @@ def handle_file_listen(config):
                         logging.info(f"ActionAfterProcess is set to none - leaving file: {original_file_name}")
                         if config.ActionAfterProcess == ActionAfter.NONE:
                             if config.Locking:
-                                local_fs.move(file_name, original_file_name)
+                                fs.move(file_name, original_file_name)
                         logging.info(f"Successfully transfered file: {original_file_name}")
                         continue
                     
                     # action delete
                     if config.ActionAfterProcess == ActionAfter.DELETE:
                         logging.info(f"ActionAfterProcess is set to delete: deleting file: {original_file_name}")
-                        local_fs.remove(file_name)
+                        fs.remove(file_name)
                         logging.info(f"Successfully transfered file: {original_file_name}")
                         continue
 
                     # action move
                     if config.ActionAfterProcess == ActionAfter.MOVE:
-                        move_folder = config.MoveAfterProcess
+                        move_folder = f"{additional_path}/{config.MoveAfterProcess}"
                         # create archive folder
-                        create_folder(local_fs, move_folder)
+                        create_folder(fs, move_folder)
                         target_folder = move_folder
 
                         # handle dated archive
                         if config.MoveAfterProcessDatedArchive:
                             # update target folder if must be dated
                             target_folder = f"{target_folder}/{get_dated_folder_name()}"
-                        
-                        # create folder (if not exists)
-                        create_folder(local_fs, target_folder)
 
                         # set file target name with timestamp
-                        file_name_with_timestamp=f"{datetime.now().strftime('%Y%m%d_%H%M%S%f')[:-2]}_{file_name}"
+                        file_name_with_timestamp=f"{datetime.now().strftime('%Y%m%d_%H%M%S%f')[:-2]}_{original_file_name}"
                         target_folder_file_name = f"{target_folder}/{file_name_with_timestamp}"
 
                         # if file was locked, remove lock in target
                         if config.Locking:
-                            target_folder_file_name = target_folder_file_name[:len(target_folder_file_name)-len(LOCKING_FILE_EXTENSION)]
+                            target_folder_file_name = f"{target_folder}/{original_file_name}"
 
                         # move the file to the target location
                         logging.info(f"ActionAfterProcess is set to move: moving file {original_file_name} to {target_folder_file_name}")
-                        local_fs.move(file_name, target_folder_file_name)
+                        fs.move(file_name, target_folder_file_name)
                         
                         logging.info(f"Successfully transfered file: {original_file_name}")
                     
         except Exception as e:
-            logging.error(f"Exception during local file access: {e}")
+            logging.error(f"Exception during file access: {e}")
+
+        print("sleep...")
             
         # calc sleep to match poll interval
         after_polling_timestamp = current_milli_time()

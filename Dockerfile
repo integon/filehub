@@ -13,6 +13,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Create a new image for the run stage
 FROM python:3.11.7-slim-bullseye
 
+# Install curl and remove cache
+RUN apt-get update && \
+    apt-get install -y curl && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+
 # Set the working directory inside the container
 WORKDIR /app
 
